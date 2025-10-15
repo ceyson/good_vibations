@@ -1,1 +1,1076 @@
 
+"""
+Spark Wide-Frame Reconciliation Helpers
+=======================================
+
+Purpose
+-------
+Fast, scalable helpers to compare two *wide* Spark DataFrames (e.g., ~5k
+columns) without paying the Python-per-column penalty typical of
+row-by-row Python loops (e.g., datacompy on Spark).
+
+Strategy
+--------
+1) **Row hash pass** (normalize → concat → SHA-256):
+   - Quickly identify: equal rows, mismatching rows, and missing-in-A/B keys.
+2) **Chunk hash pass** (e.g., 100 columns per chunk):
+   - For mismatching rows only, find which column chunks differ.
+3) **Drilldown pass**:
+   - For suspect rows and only the columns in bad chunks, emit tidy
+     differences: (keys, column, a_value, b_value).
+
+Key features
+------------
+- All heavy work stays in JVM/Catalyst (Spark SQL functions only; no UDFs).
+- Canonical normalization for strings, numerics, booleans, dates/timestamps.
+- Handles nulls deterministically.
+- Optional per-column checksums to pre-flag disagreeing columns.
+- Repartitioning hints to reduce shuffle and skew.
+
+Usage (quickstart)
+------------------
+>>> from spark_wideframe_compare import (
+...     NormalizationRules,
+...     compare_by_row_hash,
+...     locate_mismatch_chunks,
+...     drilldown_mismatches,
+... )
+...
+>>> KEYS = ["entity_id", "quarter"]
+>>> rules = NormalizationRules(
+...     string_trim=True,
+...     string_lower=True,
+...     numeric_round_scale=6,
+... )
+>>> row_result = compare_by_row_hash(dfA, dfB, keys=KEYS, rules=rules, partitions=400)
+>>> if row_result["all_equal"]:
+...     print("Tables are identical.")
+... else:
+...     chunk_result = locate_mismatch_chunks(
+...         dfA, dfB, keys=KEYS, rules=rules, chunk_size=100,
+...         restrict_to_keys=row_result["mismatch_keys"],
+...     )
+...     diffs = drilldown_mismatches(
+...         dfA, dfB, keys=KEYS, rules=rules,
+...         restrict_to_keys=row_result["mismatch_keys"],
+...         restrict_to_chunks=chunk_result["bad_chunk_indices"],
+...     )
+...     diffs.show(50, truncate=False)
+
+Implementation notes
+--------------------
+- Choose a delimiter unlikely to appear in real data for the row/segment
+  concatenation (we use the Unit Separator "\u241F").
+- Hash algorithm is SHA-256 via `sha2(..., 256)`.
+- For very wide frames, avoid building extremely large `select` lists with
+  thousands of expressions more than necessary. These helpers try to
+  construct each stage once per side (A/B).
+
+MIT License (c) 2025
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
+
+# =========================
+# Configuration & Utilities
+# =========================
+
+DELIM = "\u241F"  # Unit Separator – low chance of collision in real data
+NULL_TOKEN = "<NULL>"
+
+
+@dataclass
+class NormalizationRules:
+    """Normalization options applied before hashing/comparison.
+
+    Attributes
+    ----------
+    string_trim : bool
+        Trim leading/trailing whitespace for string columns.
+    string_lower : bool
+        Lowercase strings for case-insensitive comparison.
+    numeric_round_scale : Optional[int]
+        If set, round numerics to this number of decimal places using
+        `bround`. Useful when upstream systems format floats differently.
+    date_fmt : str
+        Canonical date format for hashing (Spark `date_format`).
+    timestamp_fmt : str
+        Canonical timestamp format for hashing (Spark `date_format`).
+    cast_bools_to_int : bool
+        If True, cast booleans to 0/1 strings for stability.
+    """
+
+    string_trim: bool = True
+    string_lower: bool = False
+    numeric_round_scale: Optional[int] = None
+    date_fmt: str = "yyyy-MM-dd"
+    timestamp_fmt: str = "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
+    cast_bools_to_int: bool = True
+
+
+# ----------
+# Type utils
+# ----------
+
+def _is_numeric(dt: T.DataType) -> bool:
+    return isinstance(
+        dt,
+        (
+            T.ByteType,
+            T.ShortType,
+            T.IntegerType,
+            T.LongType,
+            T.FloatType,
+            T.DoubleType,
+            T.DecimalType,
+        ),
+    )
+
+
+def _is_string(dt: T.DataType) -> bool:
+    return isinstance(dt, T.StringType)
+
+
+def _is_bool(dt: T.DataType) -> bool:
+    return isinstance(dt, T.BooleanType)
+
+
+def _is_date(dt: T.DataType) -> bool:
+    return isinstance(dt, T.DateType)
+
+
+def _is_timestamp(dt: T.DataType) -> bool:
+    return isinstance(dt, T.TimestampType)
+
+
+# ==========================
+# Normalization expressions
+# ==========================
+
+def normalize_col(col: F.Column, dt: T.DataType, rules: NormalizationRules) -> F.Column:
+    """Return a **string** column representing the normalized value.
+
+    All outputs are strings; nulls become NULL_TOKEN.
+    """
+    c = col
+
+    if _is_numeric(dt):
+        if rules.numeric_round_scale is not None:
+            # Use bround for deterministic banker's rounding
+            c = F.bround(c.cast("double"), rules.numeric_round_scale)
+        # Cast to string after rounding
+        c = c.cast("string")
+        return F.coalesce(c, F.lit(NULL_TOKEN))
+
+    if _is_string(dt):
+        if rules.string_trim:
+            c = F.trim(c)
+        if rules.string_lower:
+            c = F.lower(c)
+        c = c.cast("string")
+        return F.coalesce(c, F.lit(NULL_TOKEN))
+
+    if _is_bool(dt):
+        if rules.cast_bools_to_int:
+            c = F.when(c.isNull(), F.lit(NULL_TOKEN)).otherwise(F.when(c, F.lit("1")).otherwise(F.lit("0")))
+            return c
+        c = c.cast("string")
+        return F.coalesce(c, F.lit(NULL_TOKEN))
+
+    if _is_date(dt):
+        c = F.date_format(c, rules.date_fmt)
+        return F.coalesce(c, F.lit(NULL_TOKEN))
+
+    if _is_timestamp(dt):
+        c = F.date_format(c, rules.timestamp_fmt)
+        return F.coalesce(c, F.lit(NULL_TOKEN))
+
+    # Fallback: cast any other types (arrays, structs) to JSON string
+    c = F.to_json(c)
+    return F.coalesce(c, F.lit(NULL_TOKEN))
+
+
+def normalize_exprs(df: DataFrame, cols: Sequence[str], rules: NormalizationRules) -> List[F.Column]:
+    schema_by_name: Dict[str, T.DataType] = {f.name: f.dataType for f in df.schema.fields}
+    out: List[F.Column] = []
+    for c in cols:
+        dt = schema_by_name[c]
+        out.append(normalize_col(F.col(c), dt, rules))
+    return out
+
+
+# ==========================
+# Row-hash & comparisons
+# ==========================
+
+def compute_row_hash(
+    df: DataFrame,
+    keys: Sequence[str],
+    cols: Optional[Sequence[str]] = None,
+    rules: Optional[NormalizationRules] = None,
+    hash_bits: int = 256,
+    alias: str = "row_hash",
+) -> DataFrame:
+    """Return df[keys] + SHA-hash column over normalized *cols*.
+
+    If cols is None, uses all non-key columns in df.
+    """
+    rules = rules or NormalizationRules()
+    if cols is None:
+        cols = [c for c in df.columns if c not in keys]
+    norm = normalize_exprs(df, cols, rules)
+    cat = F.concat_ws(DELIM, *norm)
+    return df.select(*[F.col(k) for k in keys], F.sha2(cat, hash_bits).alias(alias))
+
+
+def compare_by_row_hash(
+    dfA: DataFrame,
+    dfB: DataFrame,
+    keys: Sequence[str],
+    cols: Optional[Sequence[str]] = None,
+    rules: Optional[NormalizationRules] = None,
+    hash_bits: int = 256,
+    partitions: Optional[int] = None,
+) -> Dict[str, DataFrame | bool]:
+    """Fast first-pass comparison of two tables using row hashes.
+
+    Returns a dict with:
+      - all_equal: bool (no mismatches, no missing on either side)
+      - mismatch_keys: DataFrame[keys] – rows with different row_hash
+      - missing_in_B: DataFrame[keys] – present in A, absent in B
+      - missing_in_A: DataFrame[keys] – present in B, absent in A
+    """
+    rules = rules or NormalizationRules()
+
+    hA = compute_row_hash(dfA, keys, cols, rules, hash_bits, alias="hA")
+    hB = compute_row_hash(dfB, keys, cols, rules, hash_bits, alias="hB")
+
+    if partitions:
+        hA = hA.repartition(partitions, *[F.col(k) for k in keys]).sortWithinPartitions(*keys)
+        hB = hB.repartition(partitions, *[F.col(k) for k in keys]).sortWithinPartitions(*keys)
+
+    joined = hA.join(hB, on=list(keys), how="inner")
+    mismatch_keys = joined.where(F.col("hA") != F.col("hB")).select(*[F.col(k) for k in keys])
+
+    missing_in_B = hA.join(hB, on=list(keys), how="left_anti").select(*[F.col(k) for k in keys])
+    missing_in_A = hB.join(hA, on=list(keys), how="left_anti").select(*[F.col(k) for k in keys])
+
+    all_equal = (
+        mismatch_keys.limit(1).count() == 0
+        and missing_in_B.limit(1).count() == 0
+        and missing_in_A.limit(1).count() == 0
+    )
+
+    return {
+        "all_equal": all_equal,
+        "mismatch_keys": mismatch_keys,
+        "missing_in_B": missing_in_B,
+        "missing_in_A": missing_in_A,
+    }
+
+
+# ==========================
+# Chunk-hash narrowing stage
+# ==========================
+
+def _chunk(lst: Sequence[str], size: int) -> List[List[str]]:
+    return [list(lst[i : i + size]) for i in range(0, len(lst), size)]
+
+
+def compute_chunk_hashes(
+    df: DataFrame,
+    keys: Sequence[str],
+    cols: Sequence[str],
+    rules: Optional[NormalizationRules] = None,
+    chunk_size: int = 100,
+    hash_bits: int = 256,
+    prefix: str = "h",
+) -> Tuple[DataFrame, List[List[str]]]:
+    """Return (DataFrame, chunks) where DataFrame has keys + one hash per chunk.
+
+    The resulting DataFrame has columns: keys + h000, h001, ...
+    """
+    rules = rules or NormalizationRules()
+    chunks = _chunk(cols, chunk_size)
+
+    select_cols: List[F.Column] = [F.col(k) for k in keys]
+    for i, ch in enumerate(chunks):
+        norm = normalize_exprs(df, ch, rules)
+        cat = F.concat_ws(DELIM, *norm)
+        select_cols.append(F.sha2(cat, hash_bits).alias(f"{prefix}{i:03d}"))
+
+    out = df.select(*select_cols)
+    return out, chunks
+
+
+def locate_mismatch_chunks(
+    dfA: DataFrame,
+    dfB: DataFrame,
+    keys: Sequence[str],
+    cols: Optional[Sequence[str]] = None,
+    rules: Optional[NormalizationRules] = None,
+    chunk_size: int = 100,
+    restrict_to_keys: Optional[DataFrame] = None,
+    partitions: Optional[int] = None,
+) -> Dict[str, object]:
+    """For mismatching rows, identify which chunks (groups of columns) differ.
+
+    Returns a dict:
+      - bad_chunk_indices: List[int]
+      - per_row_bad_flags: DataFrame[keys + bad_000..bad_NNN bools]
+      - chunks: List[List[str]] – actual column names per chunk
+    """
+    rules = rules or NormalizationRules()
+
+    if cols is None:
+        cols = [c for c in dfA.columns if c not in keys]
+
+    # Optional key restriction to only mismatching rows discovered earlier
+    A0 = dfA
+    B0 = dfB
+    if restrict_to_keys is not None:
+        A0 = A0.join(restrict_to_keys, on=list(keys), how="inner")
+        B0 = B0.join(restrict_to_keys, on=list(keys), how="inner")
+
+    hA, chunks = compute_chunk_hashes(A0, keys, cols, rules, chunk_size, prefix="A_")
+    hB, _ = compute_chunk_hashes(B0, keys, cols, rules, chunk_size, prefix="B_")
+
+    if partitions:
+        hA = hA.repartition(partitions, *[F.col(k) for k in keys]).sortWithinPartitions(*keys)
+        hB = hB.repartition(partitions, *[F.col(k) for k in keys]).sortWithinPartitions(*keys)
+
+    j = hA.join(hB, on=list(keys), how="inner")
+
+    bad_cols = []
+    bad_indices: List[int] = []
+    for i in range(len(chunks)):
+        a = F.col(f"A_{i:03d}")
+        b = F.col(f"B_{i:03d}")
+        bad_name = f"bad_{i:03d}"
+        bad_cols.append((bad_name, (a != b).alias(bad_name)))
+
+    per_row_bad = j.select(
+        *[F.col(k) for k in keys],
+        *[expr for _, expr in bad_cols],
+    )
+
+    # Aggregate which chunk indices are bad anywhere (to limit drilldown)
+    agg_exprs = [F.max(F.col(name).cast("int")).alias(name) for name, _ in bad_cols]
+    agg_row = per_row_bad.agg(*agg_exprs).collect()[0].asDict()
+
+    bad_indices = [i for i in range(len(chunks)) if agg_row.get(f"bad_{i:03d}", 0) == 1]
+
+    return {
+        "bad_chunk_indices": bad_indices,
+        "per_row_bad_flags": per_row_bad,
+        "chunks": chunks,
+    }
+
+
+# =====================
+# Drilldown differences
+# =====================
+
+def _flat_select(df: DataFrame, cols: Sequence[str]) -> DataFrame:
+    return df.select(*[F.col(c) for c in cols])
+
+
+def drilldown_mismatches(
+    dfA: DataFrame,
+    dfB: DataFrame,
+    keys: Sequence[str],
+    cols: Optional[Sequence[str]] = None,
+    rules: Optional[NormalizationRules] = None,
+    restrict_to_keys: Optional[DataFrame] = None,
+    restrict_to_chunks: Optional[Iterable[int]] = None,
+    chunk_size: int = 100,
+) -> DataFrame:
+    """Emit tidy long-form differences for suspect keys/columns only.
+
+    Returns DataFrame with columns:
+      keys..., column, a_value, b_value
+    Only rows where normalized A != normalized B are returned.
+    """
+    rules = rules or NormalizationRules()
+    if cols is None:
+        cols = [c for c in dfA.columns if c not in keys]
+
+    # Optionally reduce to subset of columns based on bad chunk indices
+    if restrict_to_chunks is not None:
+        chunks = _chunk(cols, chunk_size)
+        keep_cols: List[str] = []
+        for idx in restrict_to_chunks:
+            if 0 <= idx < len(chunks):
+                keep_cols.extend(chunks[idx])
+        cols = keep_cols or cols
+
+    A0 = dfA
+    B0 = dfB
+    if restrict_to_keys is not None:
+        A0 = A0.join(restrict_to_keys, on=list(keys), how="inner")
+        B0 = B0.join(restrict_to_keys, on=list(keys), how="inner")
+
+    # Normalize selected cols to string on both sides
+    normA = normalize_exprs(A0, cols, rules)
+    normB = normalize_exprs(B0, cols, rules)
+
+    # Build arrays: create col_names **once** on A side to avoid ambiguity
+    name_array = F.array(*[F.lit(c) for c in cols]).alias("col_names")
+    A_array = F.array(*normA).alias("A_vals")
+    B_array = F.array(*normB).alias("B_vals")
+
+    A_arr_df = A0.select(*[F.col(k) for k in keys], name_array, A_array)
+    # Give B a distinct name for its names array (not used) and only keep B_vals
+    B_arr_df = B0.select(*[F.col(k) for k in keys], B_array)
+
+    j = A_arr_df.join(B_arr_df, on=list(keys), how="inner")
+
+    zipped = F.arrays_zip(F.col("col_names"), F.col("A_vals"), F.col("B_vals"))
+
+    long_df = (
+        j.select(*[F.col(k) for k in keys], F.explode(zipped).alias("z"))
+        .select(
+            *[F.col(k) for k in keys],
+            F.col("z.col_names").alias("column"),
+            F.col("z.A_vals").alias("a_value"),
+            F.col("z.B_vals").alias("b_value"),
+        )
+        .where(F.col("a_value") != F.col("b_value"))
+    )
+
+    return long_df
+
+
+# =====================
+# Column checksum (fast)
+# =====================
+
+def column_checksums(
+    df: DataFrame,
+    cols: Sequence[str],
+) -> DataFrame:
+    """Compute a quick checksum per column using xxhash64.
+
+    Returns DataFrame with columns: column, checksum (as long/int).
+    (Collisions are exceedingly rare; use to *pre-flag* columns.)
+    """
+    exprs = [F.sum(F.xxhash64(F.col(c).cast("string"))).alias(c) for c in cols]
+    row = df.agg(*exprs)
+    # convert the single-row wide DF into long form
+    kv = [F.struct(F.lit(c).alias("column"), F.col(c).alias("checksum")) for c in cols]
+    return row.select(F.explode(F.array(*kv)).alias("kv")).select("kv.*")
+
+
+# =====================
+# Practical Spark knobs
+# =====================
+
+def prepare_for_join(df: DataFrame, keys: Sequence[str], partitions: Optional[int] = None) -> DataFrame:
+    """Repartition and sort to make joins cheaper. No-op if partitions=None."""
+    if partitions is None:
+        return df
+    return df.repartition(partitions, *[F.col(k) for k in keys]).sortWithinPartitions(*keys)
+
+
+# =====================
+# Validation helpers & safer injector
+# =====================
+
+def validate_columns(df: DataFrame, keys: Sequence[str], cols: Optional[Sequence[str]] = None) -> Tuple[List[str], List[str]]:
+    """Return (use_cols, skipped_cols) after validating against df.columns.
+
+    - Ensures keys are present
+    - Ensures cols exist; drops missing and returns them in skipped_cols
+    - Warns if any top-level columns are StructType (you likely joined with aliases)
+    """
+    df_cols = set(df.columns)
+    missing_keys = [k for k in keys if k not in df_cols]
+    if missing_keys:
+        raise KeyError(f"Keys not in DataFrame: {missing_keys}")
+
+    all_cols = [c for c in df.columns if c not in keys] if cols is None else list(cols)
+    use_cols = [c for c in all_cols if c in df_cols]
+    skipped = [c for c in all_cols if c not in df_cols]
+
+    # Detect likely joined-struct scenario (df has 'A'/'B' top-level structs)
+    struct_tops = [f.name for f in df.schema.fields if isinstance(f.dataType, T.StructType)]
+    if struct_tops:
+        print(
+            "[validate_columns] Warning: top-level struct columns detected: "
+            f"{struct_tops}. If you joined with aliases (e.g., dfA.alias('A')), "
+            "select the base DF before injecting deltas."
+        )
+
+    return use_cols, skipped
+
+
+def inject_point_deltas_safe(
+    df: DataFrame,
+    keys: Sequence[str],
+    cols: Optional[Sequence[str]] = None,
+    *,
+    frac_cells: float = 0.001,
+    seed: int = 42,
+    numeric_mode: str = "add",      # "add" or "mul"
+    numeric_delta: float = 0.5,     # add: +0.5 ; mul: ×1.02 etc.
+    string_suffix: str = "_Δ",      # appended on change
+) -> DataFrame:
+    """Safer variant of injector: skips unknown cols and reports them.
+
+    Use this if you're seeing KeyError on a column name.
+    """
+    use_cols, skipped = validate_columns(df, keys, cols)
+    if skipped:
+        print(
+            f"[inject_point_deltas_safe] Skipping {len(skipped)} unknown columns: "
+            f"{skipped[:10]}{' ...' if len(skipped) > 10 else ''}"
+        )
+
+    schema = {f.name: f.dataType for f in df.schema.fields}
+
+    out_cols = [F.col(k) for k in keys]
+
+    for c in use_cols:
+        dt = schema[c]
+        u = _cell_u01(keys, c, seed)
+        cond = u < F.lit(frac_cells)
+
+        if isinstance(dt, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
+            base = F.col(c).cast("double")
+            mutated = (base * F.lit(numeric_delta)) if numeric_mode == "mul" else (base + F.lit(numeric_delta))
+            if isinstance(dt, T.ByteType):
+                cast_back = mutated.cast("byte")
+            elif isinstance(dt, T.ShortType):
+                cast_back = mutated.cast("short")
+            elif isinstance(dt, T.IntegerType):
+                cast_back = mutated.cast("int")
+            else:
+                cast_back = mutated.cast("bigint")
+            newc = F.when(cond & base.isNotNull(), cast_back).otherwise(F.col(c))
+
+        elif isinstance(dt, (T.FloatType, T.DoubleType, T.DecimalType)):
+            base = F.col(c).cast("double")
+            mutated = (base * F.lit(numeric_delta)) if numeric_mode == "mul" else (base + F.lit(numeric_delta))
+            if isinstance(dt, T.DecimalType):
+                newc = F.when(cond & base.isNotNull(), mutated.cast(T.DecimalType(dt.precision, dt.scale))).otherwise(F.col(c))
+            else:
+                newc = F.when(cond & base.isNotNull(), mutated).otherwise(F.col(c)).cast(type(dt)())
+
+        elif isinstance(dt, T.BooleanType):
+            newc = F.when(cond & F.col(c).isNotNull(), ~F.col(c)).otherwise(F.col(c))
+
+        elif isinstance(dt, T.StringType):
+            newc = F.when(cond & F.col(c).isNotNull(), F.concat_ws("", F.col(c), F.lit(string_suffix))).otherwise(F.col(c))
+
+        elif isinstance(dt, (T.DateType, T.TimestampType)):
+            if isinstance(dt, T.DateType):
+                newc = F.when(cond & F.col(c).isNotNull(), F.date_add(F.col(c), 1)).otherwise(F.col(c))
+            else:
+                newc = F.when(cond & F.col(c).isNotNull(), F.col(c) + F.expr("INTERVAL 1 SECOND")).otherwise(F.col(c))
+
+        else:
+            newc = F.col(c)
+
+        out_cols.append(newc.alias(c))
+
+    return df.select(*out_cols)
+
+
+# =====================
+# Reporting & Orchestration
+# =====================
+
+def summarize_diffs(
+    diffs: DataFrame,
+    keys: Sequence[str],
+) -> Tuple[DataFrame, DataFrame]:
+    """Return (column_summary, key_summary) from a tidy long diffs DF.
+
+    column_summary: column, n_diff_cells, n_rows_with_diff
+    key_summary: keys..., n_columns_diff
+    """
+    from pyspark.sql import functions as F
+
+    col_summary = (
+        diffs.groupBy("column")
+        .agg(
+            F.count("*").alias("n_diff_cells"),
+            F.countDistinct(*[F.col(k) for k in keys]).alias("n_rows_with_diff"),
+        )
+        .orderBy(F.desc("n_diff_cells"))
+    )
+
+    # Count how many columns differ per key (row)
+    key_group_cols = [F.col(k) for k in keys]
+    key_summary = (
+        diffs.groupBy(*key_group_cols)
+        .agg(F.countDistinct("column").alias("n_columns_diff"))
+        .orderBy(F.desc("n_columns_diff"))
+    )
+
+    return col_summary, key_summary
+
+
+def _fmt_int(n: int) -> str:
+    return f"{n:,}"
+
+
+def render_proc_compare_report(
+    *,
+    keys: Sequence[str],
+    total_A_rows: int,
+    total_B_rows: int,
+    matched_row_count: int,
+    mismatch_row_count: int,
+    missing_in_A_count: int,
+    missing_in_B_count: int,
+    column_summary: DataFrame,
+    top_k_columns: int = 25,
+    n_columns_with_diffs: Optional[int] = None,
+) -> str:
+    """Produce a PROC COMPARE–style text summary from Spark counts/DFs.
+
+    Robust to empty/placeholder `column_summary`. If `n_columns_with_diffs`
+    is provided, it will be used directly (avoids recomputing counts in tests).
+    """
+    # Compute how many columns have any diffs, safely
+    try:
+        n_cols = int(n_columns_with_diffs) if n_columns_with_diffs is not None else int(column_summary.count())
+    except Exception:
+        n_cols = 0
+
+    header = [
+        "==================== PROC COMPARE (Spark) ====================",
+        f"Keys: {', '.join(keys)}",
+        f"Table A rows: {_fmt_int(total_A_rows)}",
+        f"Table B rows: {_fmt_int(total_B_rows)}",
+        f"Matched keys (inner join): {_fmt_int(matched_row_count)}",
+        f"Rows with any differences: {_fmt_int(mismatch_row_count)}",
+        f"Missing in A (present only in B): {_fmt_int(missing_in_A_count)}",
+        f"Missing in B (present only in A): {_fmt_int(missing_in_B_count)}",
+        f"Columns with any differences: {_fmt_int(n_cols)}",
+        "--------------------------------------------------------------",
+        f"Top {top_k_columns} differing columns:",
+        "column | n_diff_cells | n_rows_with_diff",
+        "------ | ------------- | ----------------",
+    ]
+
+    rows = []
+    # Guard against column_summary being an empty placeholder DF
+    limited = column_summary.limit(top_k_columns)
+    for r in limited.collect():
+        rows.append(f"{r['column']} | {_fmt_int(r['n_diff_cells'])} | {_fmt_int(r['n_rows_with_diff'])}")
+
+    return "
+".join(header + rows)
+
+
+def compare_and_report(
+    dfA: DataFrame,
+    dfB: DataFrame,
+    *,
+    keys: Sequence[str],
+    cols: Optional[Sequence[str]] = None,
+    rules: Optional[NormalizationRules] = None,
+    chunk_size: int = 100,
+    partitions: Optional[int] = None,
+    top_k_columns: int = 25,
+    return_artifacts: bool = True,
+) -> Tuple[str, Dict[str, object]]:
+    """Full pipeline: row-hash -> chunk-hash -> drilldown -> report.
+
+    Returns (report_text, artifacts_dict). Artifacts include:
+      - 'row_res' (dict), 'chunk_res' (dict), 'diffs' (DataFrame),
+        'column_summary' (DataFrame), 'key_summary' (DataFrame)
+    """
+    from pyspark.sql import functions as F
+
+    rules = rules or NormalizationRules()
+
+    # Basic counts
+    total_A_rows = dfA.select(*[F.col(k) for k in keys]).distinct().count()
+    total_B_rows = dfB.select(*[F.col(k) for k in keys]).distinct().count()
+
+    row_res = compare_by_row_hash(
+        dfA, dfB, keys=keys, cols=cols, rules=rules, partitions=partitions
+    )
+
+    missing_in_A_count = row_res["missing_in_A"].count()
+    missing_in_B_count = row_res["missing_in_B"].count()
+
+    matched_row_count = (
+        dfA.select(*keys).intersect(dfB.select(*keys)).count()
+    )
+
+    mismatch_row_count = row_res["mismatch_keys"].count()
+
+    # If all equal, render a tiny report and exit early
+    if row_res["all_equal"]:
+        empty_cols = dfA.limit(0).select(F.lit(None).cast("string").alias("column"), F.lit(0).cast("long").alias("n_diff_cells"), F.lit(0).cast("long").alias("n_rows_with_diff")).where("1=0")
+        report = render_proc_compare_report(
+            keys=keys,
+            total_A_rows=total_A_rows,
+            total_B_rows=total_B_rows,
+            matched_row_count=matched_row_count,
+            mismatch_row_count=0,
+            missing_in_A_count=missing_in_A_count,
+            missing_in_B_count=missing_in_B_count,
+            column_summary=empty_cols,
+            n_columns_with_diffs=0,
+        )
+        return report, {"row_res": row_res, "diffs": dfA.limit(0)}
+
+    # Narrow by chunks and drill down
+    chunk_res = locate_mismatch_chunks(
+        dfA, dfB, keys=keys, cols=cols, rules=rules,
+        chunk_size=chunk_size, restrict_to_keys=row_res["mismatch_keys"],
+        partitions=partitions,
+    )
+
+    diffs = drilldown_mismatches(
+        dfA, dfB, keys=keys, cols=cols, rules=rules,
+        restrict_to_keys=row_res["mismatch_keys"],
+        restrict_to_chunks=chunk_res["bad_chunk_indices"],
+        chunk_size=chunk_size,
+    )
+
+    column_summary, key_summary = summarize_diffs(diffs, keys)
+
+    report = render_proc_compare_report(
+        keys=keys,
+        total_A_rows=total_A_rows,
+        total_B_rows=total_B_rows,
+        matched_row_count=matched_row_count,
+        mismatch_row_count=mismatch_row_count,
+        missing_in_A_count=missing_in_A_count,
+        missing_in_B_count=missing_in_B_count,
+        column_summary=column_summary,
+        top_k_columns=top_k_columns,
+    )
+
+    artifacts = {
+        "row_res": row_res,
+        "chunk_res": chunk_res,
+        "diffs": diffs,
+        "column_summary": column_summary,
+        "key_summary": key_summary,
+    }
+    return (report, artifacts) if return_artifacts else (report, {})
+
+
+def write_compare_artifacts(
+    *,
+    diffs: DataFrame,
+    column_summary: DataFrame,
+    key_summary: DataFrame,
+    output_format: str = "delta",
+    base_path_or_table: Optional[str] = None,
+    table_names: Optional[Tuple[str, str, str]] = None,
+    mode: str = "overwrite",
+) -> None:
+    """Persist artifacts as Delta/Parquet/CSV or save as tables.
+
+    If table_names provided, writes to Spark tables; otherwise base_path is used.
+    """
+    if table_names is not None:
+        t_diffs, t_cols, t_keys = table_names
+        diffs.write.mode(mode).format(output_format).saveAsTable(t_diffs)
+        column_summary.write.mode(mode).format(output_format).saveAsTable(t_cols)
+        key_summary.write.mode(mode).format(output_format).saveAsTable(t_keys)
+        return
+
+    if base_path_or_table is None:
+        raise ValueError("Provide either table_names or base_path_or_table")
+
+    base = base_path_or_table.rstrip("/")
+    diffs.write.mode(mode).format(output_format).save(f"{base}/diffs_long")
+    column_summary.write.mode(mode).format(output_format).save(f"{base}/column_summary")
+    key_summary.write.mode(mode).format(output_format).save(f"{base}/key_summary")
+
+
+# =====================
+# OO Wrapper (class-based API)
+# =====================
+
+class WideframeComparatorSpark:
+    """Stateful wrapper around the functional API for convenience.
+
+    Typical use:
+        cmp = WideframeComparatorSpark(keys=["entity_id","quarter"],
+                                       rules=NormalizationRules(numeric_round_scale=6),
+                                       chunk_size=100, partitions=400)
+        # Optionally create a mutated copy for testing
+        dfB = cmp.inject_deltas(dfA, frac_cells=0.001, seed=123)
+
+        # Ground-truth via row hashes (expected mismatch keys after injection)
+        gt = cmp.ground_truth_via_hash(dfA, dfB)
+        print(gt["mismatch_row_count"], "expected mismatching rows (row-hash)")
+
+        # Full compare + report
+        report, art = cmp.run_compare(dfA, dfB)
+        print(report)
+    """
+
+    def __init__(
+        self,
+        *,
+        keys: Sequence[str],
+        rules: Optional[NormalizationRules] = None,
+        cols: Optional[Sequence[str]] = None,
+        chunk_size: int = 100,
+        partitions: Optional[int] = None,
+        top_k_columns: int = 25,
+    ) -> None:
+        self.keys = list(keys)
+        self.rules = rules or NormalizationRules()
+        self.cols = list(cols) if cols is not None else None
+        self.chunk_size = chunk_size
+        self.partitions = partitions
+        self.top_k_columns = top_k_columns
+
+    # ---------- convenience ----------
+    def _resolve_cols(self, df: DataFrame, cols: Optional[Sequence[str]] = None) -> List[str]:
+        if cols is not None:
+            return list(cols)
+        if self.cols is not None:
+            return list(self.cols)
+        return [c for c in df.columns if c not in self.keys]
+
+    # ---------- delta injection ----------
+    def inject_deltas(
+        self,
+        df: DataFrame,
+        *,
+        cols: Optional[Sequence[str]] = None,
+        frac_cells: float = 0.001,
+        seed: int = 42,
+        numeric_mode: str = "add",
+        numeric_delta: float = 0.5,
+        string_suffix: str = "_Δ",
+    ) -> DataFrame:
+        """Create a mutated copy with sparse, deterministic cell deltas."""
+        use_cols = self._resolve_cols(df, cols)
+        return inject_point_deltas_safe(
+            df,
+            keys=self.keys,
+            cols=use_cols,
+            frac_cells=frac_cells,
+            seed=seed,
+            numeric_mode=numeric_mode,
+            numeric_delta=numeric_delta,
+            string_suffix=string_suffix,
+        )
+
+    # ---------- hashing helpers ----------
+    def row_hash(self, df: DataFrame, *, alias: str = "row_hash", cols: Optional[Sequence[str]] = None, hash_bits: int = 256) -> DataFrame:
+        use_cols = self._resolve_cols(df, cols)
+        return compute_row_hash(df, self.keys, use_cols, self.rules, hash_bits, alias)
+
+    def chunk_hashes(self, df: DataFrame, *, cols: Optional[Sequence[str]] = None) -> Tuple[DataFrame, List[List[str]]]:
+        use_cols = self._resolve_cols(df, cols)
+        return compute_chunk_hashes(df, self.keys, use_cols, self.rules, self.chunk_size)
+
+    # ---------- ground-truth via row-hash ----------
+    def ground_truth_via_hash(
+        self,
+        dfA: DataFrame,
+        dfB: DataFrame,
+        *,
+        cols: Optional[Sequence[str]] = None,
+        hash_bits: int = 256,
+    ) -> Dict[str, object]:
+        """Fast expected mismatch counts using only row hashes.
+
+        Useful to validate that a synthetic delta injection produced the
+        intended number of mismatching rows without the full drilldown.
+        """
+        use_cols = self._resolve_cols(dfA, cols)
+        res = compare_by_row_hash(
+            dfA, dfB,
+            keys=self.keys,
+            cols=use_cols,
+            rules=self.rules,
+            hash_bits=hash_bits,
+            partitions=self.partitions,
+        )
+        return {
+            "all_equal": res["all_equal"],
+            "mismatch_keys": res["mismatch_keys"],
+            "missing_in_A": res["missing_in_A"],
+            "missing_in_B": res["missing_in_B"],
+            "mismatch_row_count": res["mismatch_keys"].count(),
+        }
+
+    # ---------- full comparison & report ----------
+    def run_compare(
+        self,
+        dfA: DataFrame,
+        dfB: DataFrame,
+        *,
+        cols: Optional[Sequence[str]] = None,
+        top_k_columns: Optional[int] = None,
+    ) -> Tuple[str, Dict[str, object]]:
+        """Orchestrate row-hash → chunk-hash → drilldown → report."""
+        use_cols = self._resolve_cols(dfA, cols)
+        return compare_and_report(
+            dfA,
+            dfB,
+            keys=self.keys,
+            cols=use_cols,
+            rules=self.rules,
+            chunk_size=self.chunk_size,
+            partitions=self.partitions,
+            top_k_columns=top_k_columns if top_k_columns is not None else self.top_k_columns,
+            return_artifacts=True,
+        )
+
+
+# =====================
+# Class extras: smart compare + HTML display
+# =====================
+
+    def smart_compare(
+        self,
+        dfA: DataFrame,
+        dfB: DataFrame,
+        *,
+        cols: Optional[Sequence[str]] = None,
+        prune_equal_columns: bool = True,
+        top_k_columns: Optional[int] = None,
+    ) -> Tuple[str, Dict[str, object]]:
+        """Compare with optional pre-pruning of obviously-equal columns.
+
+        Uses fast xxhash64 column checksums to drop equal columns before the
+        chunk/drilldown stages. Returns the same (report, artifacts) as
+        run_compare, with an extra artifacts['pruned_columns'] list.
+        """
+        use_cols = self._resolve_cols(dfA, cols)
+        pruned_cols = use_cols
+        if prune_equal_columns and use_cols:
+            from pyspark.sql import functions as F  # local import
+            eq = (
+                column_checksums(dfA, use_cols).alias("A")
+                .join(column_checksums(dfB, use_cols).alias("B"), "column")
+                .where(F.col("A.checksum") == F.col("B.checksum"))
+                .select("column")
+            )
+            equal_set = {r["column"] for r in eq.collect()}
+            pruned_cols = [c for c in use_cols if c not in equal_set]
+        report, art = compare_and_report(
+            dfA,
+            dfB,
+            keys=self.keys,
+            cols=pruned_cols,
+            rules=self.rules,
+            chunk_size=self.chunk_size,
+            partitions=self.partitions,
+            top_k_columns=top_k_columns if top_k_columns is not None else self.top_k_columns,
+            return_artifacts=True,
+        )
+        art["pruned_columns"] = [c for c in use_cols if c not in pruned_cols]
+        return report, art
+
+    def display_report(
+        self,
+        report_text: str,
+        artifacts: Dict[str, object],
+        *,
+        top_k_columns: Optional[int] = None,
+        also_print_text: bool = True,
+        title: str = "PROC COMPARE (Spark)",
+    ) -> None:
+        """Pretty HTML summary in notebooks, using metrics from artifacts.
+
+        Falls back to plain text if HTML isn't supported.
+        """
+        metrics = artifacts.get("metrics", {}) if isinstance(artifacts, dict) else {}
+        # Fallbacks if metrics not present
+        if metrics:
+            total_A_rows = metrics.get("total_A_rows", 0)
+            total_B_rows = metrics.get("total_B_rows", 0)
+            matched_row_count = metrics.get("matched_row_count", 0)
+            mismatch_row_count = metrics.get("mismatch_row_count", 0)
+            missing_in_A_count = metrics.get("missing_in_A_count", 0)
+            missing_in_B_count = metrics.get("missing_in_B_count", 0)
+        else:
+            rr = artifacts.get("row_res", {}) if isinstance(artifacts, dict) else {}
+            # These counts will each trigger a job; metrics path is preferred
+            total_A_rows = 0
+            total_B_rows = 0
+            matched_row_count = 0
+            mismatch_row_count = rr.get("mismatch_keys").count() if rr else 0
+            missing_in_A_count = rr.get("missing_in_A").count() if rr else 0
+            missing_in_B_count = rr.get("missing_in_B").count() if rr else 0
+        column_summary = artifacts.get("column_summary") if isinstance(artifacts, dict) else None
+        if also_print_text and report_text:
+            print(report_text)
+            print("\n")
+        html = render_proc_compare_html(
+            keys=self.keys,
+            total_A_rows=total_A_rows,
+            total_B_rows=total_B_rows,
+            matched_row_count=matched_row_count,
+            mismatch_row_count=mismatch_row_count,
+            missing_in_A_count=missing_in_A_count,
+            missing_in_B_count=missing_in_B_count,
+            column_summary=column_summary,
+            top_k_columns=top_k_columns if top_k_columns is not None else self.top_k_columns,
+            title=title,
+        )
+        _try_display_html(html)
+
+# =====================
+# Optional CLI example
+# =====================
+if __name__ == "__main__":
+    # This block is illustrative; adapt to your environment / cluster.
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.builder.getOrCreate()
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    spark.conf.set("spark.sql.shuffle.partitions", "400")  # tune to cluster size
+
+    # Replace with your real sources
+    dfA = spark.table("db.tableA")
+    dfB = spark.table("db.tableB")
+
+    KEYS = ["entity_id", "quarter"]
+    rules = NormalizationRules(string_trim=True, string_lower=False, numeric_round_scale=6)
+
+    res = compare_by_row_hash(dfA, dfB, keys=KEYS, rules=rules, partitions=400)
+    if res["all_equal"]:
+        print("✅ Tables are identical.")
+        spark.stop()
+        raise SystemExit(0)
+
+    print("🔎 Row-level differences found. Narrowing by chunks…")
+    # Optionally, skip truly equal tables quickly
+    mism_keys = res["mismatch_keys"].cache()
+
+    cols = [c for c in dfA.columns if c not in KEYS]
+    chunk_res = locate_mismatch_chunks(
+        dfA, dfB, keys=KEYS, cols=cols, rules=rules, chunk_size=100, restrict_to_keys=mism_keys, partitions=400
+    )
+
+    diffs = drilldown_mismatches(
+        dfA, dfB, keys=KEYS, cols=cols, rules=rules,
+        restrict_to_keys=mism_keys, restrict_to_chunks=chunk_res["bad_chunk_indices"],
+        chunk_size=100,
+    )
+
+    # Show a preview; write out for audit
+    diffs.show(50, truncate=False)
+    diffs.write.mode("overwrite").format("delta").saveAsTable("db.table_differences_long")
+
+    # (Optional) Column checksums
+    # chks = column_checksums(dfA, cols).alias("A").join(column_checksums(dfB, cols).alias("B"), "column")
+    # chks.where(F.col("A.checksum") != F.col("B.checksum")).show(100, truncate=False)
+
+    spark.stop()
