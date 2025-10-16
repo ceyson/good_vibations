@@ -1,0 +1,70 @@
+def render_deltas_sample_html(
+    *,
+    keys: Sequence[str],
+    sample_rows: List[Dict[str, object]],
+    title: str = "Sample cell-level deltas",
+) -> str:
+    """Build a small HTML table with numeric deltas and raw values.
+
+    Expects rows shaped like:
+      keys..., column, a_num, b_num, diff_num, rel_diff, a_value, b_value
+    """
+    def _fmt_num(v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float):
+            return f"{v:.6g}"
+        return _html_escape(str(v))
+
+    key_header = "".join(
+        f"<th style='text-align:left;border-bottom:1px solid #ddd;padding:6px 4px'>{_html_escape(k)}</th>"
+        for k in keys
+    )
+
+    body_rows = []
+    for r in sample_rows:
+        tds_keys = "".join(
+            f"<td style='padding:4px 4px'>{_html_escape(str(r.get(k, '')))}</td>"
+            for k in keys
+        )
+        body_rows.append(
+            f"<tr>"
+            f"{tds_keys}"
+            f"<td style='padding:4px 4px'>{_html_escape(str(r.get('column','')))}</td>"
+            f"<td style='text-align:right;padding:4px 4px'>{_fmt_num(r.get('a_num'))}</td>"
+            f"<td style='text-align:right;padding:4px 4px'>{_fmt_num(r.get('b_num'))}</td>"
+            f"<td style='text-align:right;padding:4px 4px'>{_fmt_num(r.get('diff_num'))}</td>"
+            f"<td style='text-align:right;padding:4px 4px'>{_fmt_num(r.get('rel_diff'))}</td>"
+            f"<td style='padding:4px 4px;color:#555'>{_html_escape(str(r.get('a_value','')))}</td>"
+            f"<td style='padding:4px 4px;color:#555'>{_html_escape(str(r.get('b_value','')))}</td>"
+            f"</tr>"
+        )
+
+    body_html = (
+        "".join(body_rows)
+        if body_rows
+        else "<tr><td colspan='999' style='padding:8px;color:#666'>No sample differences</td></tr>"
+    )
+
+    return f"""
+    <div style='font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; line-height:1.35; margin-top:14px;'>
+      <h3 style='margin:0 0 6px 0'>{_html_escape(title)}</h3>
+      <table style='border-collapse:collapse; width:100%'>
+        <thead>
+          <tr>
+            {key_header}
+            <th style='text-align:left;border-bottom:1px solid #ddd;padding:6px 4px'>column</th>
+            <th style='text-align:right;border-bottom:1px solid #ddd;padding:6px 4px'>a_num</th>
+            <th style='text-align:right;border-bottom:1px solid #ddd;padding:6px 4px'>b_num</th>
+            <th style='text-align:right;border-bottom:1px solid #ddd;padding:6px 4px'>diff_num</th>
+            <th style='text-align:right;border-bottom:1px solid #ddd;padding:6px 4px'>rel_diff</th>
+            <th style='text-align:left;border-bottom:1px solid #ddd;padding:6px 4px'>a_value</th>
+            <th style='text-align:left;border-bottom:1px solid #ddd;padding:6px 4px'>b_value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {body_html}
+        </tbody>
+      </table>
+    </div>
+    """
