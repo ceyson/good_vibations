@@ -1,0 +1,418 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Iterable, Optional, Dict, Any, List, Tuple, Literal
+import math
+import polars as pl
+
+# ---------------------------
+# Options & Result containers
+# ---------------------------
+
+NumericMethod = Literal["abs", "rel", "max"]
+
+@dataclass
+class CompareOptions:
+    id_cols: List[str]                         # like PROC COMPARE ID
+    compare_cols: Optional[List[str]] = None   # like VAR (None => all non-ID intersecting)
+    with_map: Optional[Dict[str, str]] = None  # base_col -> comp_col mapping (SAS WITH)
+    abs_tol: float = 0.0                       # CRITERION= absolute part
+    rel_tol: float = 0.0                       # relative part (0 disables)
+    method: NumericMethod = "max"              # "abs": |a-b|<=abs_tol; "rel": |a-b|<=rel_tol*scale; "max": <= max(abs, rel)
+    case_sensitive: bool = True
+    ignore_whitespace: bool = False
+    nulls_equal: bool = True                   # treat null==null as equal
+
+@dataclass
+class CompareResult:
+    summary: Dict[str, Any]
+    schema_diffs: Dict[str, Any]
+    only_in_base: pl.DataFrame
+    only_in_compare: pl.DataFrame
+    deltas_long: pl.DataFrame                  # id..., column, base_value, compare_value, equal, diff_reason
+    per_column_stats: pl.DataFrame             # column, n_compared, n_equal, n_diff, pct_equal
+
+
+# ---------------------------
+# Internal helpers
+# ---------------------------
+
+def _normalize_string_expr(expr: pl.Expr, *, case_sensitive: bool, ignore_whitespace: bool) -> pl.Expr:
+    if ignore_whitespace:
+        expr = expr.str.replace_all(r"\s+", " ").str.strip()
+    if not case_sensitive:
+        expr = expr.str.to_lowercase()
+    return expr
+
+def _numeric_threshold(a: pl.Expr, b: pl.Expr, abs_tol: float, rel_tol: float, method: NumericMethod) -> pl.Expr:
+    """
+    Returns a boolean expression for numeric equality according to `method`.
+    """
+    diff = (a - b).abs()
+    if method == "abs":
+        return diff <= pl.lit(abs_tol)
+    elif method == "rel":
+        scale = pl.max_horizontal([a.abs(), b.abs()])
+        # Treat both near 0 as scale=1 to avoid zero division; if both 0, diff must be 0 anyway.
+        return diff <= (scale * pl.lit(rel_tol))
+    else:  # "max" => SAS-like combined rule
+        if rel_tol > 0:
+            scale = pl.max_horizontal([a.abs(), b.abs()])
+            thresh = pl.max_horizontal([pl.lit(abs_tol), scale * rel_tol])
+        else:
+            thresh = pl.lit(abs_tol)
+        return diff <= thresh
+
+def _eq_with_nulls(a: pl.Expr, b: pl.Expr, nulls_equal: bool) -> pl.Expr:
+    if nulls_equal:
+        return pl.when(a.is_null() & b.is_null()).then(True).otherwise(a == b)
+    else:
+        return a == b
+
+# ---------------------------
+# Main compare
+# ---------------------------
+
+def compare_frames(
+    base: pl.DataFrame,
+    comp: pl.DataFrame,
+    options: CompareOptions,
+) -> CompareResult:
+    id_cols = options.id_cols
+    if not id_cols:
+        raise ValueError("CompareOptions.id_cols must be provided (SAS PROC COMPARE 'ID').")
+
+    base_cols = set(base.columns)
+    comp_cols = set(comp.columns)
+
+    # Build comparison pairs: list of (base_col, comp_col, reported_name)
+    pairs: List[Tuple[str, str, str]] = []
+
+    # If WITH map is supplied, honor it (only those pairs); otherwise use compare_cols or intersection
+    if options.with_map:
+        for bcol, ccol in options.with_map.items():
+            if bcol in id_cols:
+                continue
+            if bcol not in base_cols:
+                continue
+            if ccol not in comp_cols:
+                continue
+            pairs.append((bcol, ccol, bcol))  # report under base column name (SAS behavior)
+    else:
+        if options.compare_cols is None:
+            candidate = sorted((base_cols & comp_cols) - set(id_cols))
+        else:
+            candidate = [c for c in options.compare_cols if c in base_cols and c in comp_cols and c not in id_cols]
+        for c in candidate:
+            pairs.append((c, c, c))
+
+    # Schema differences
+    schema_diffs = {
+        "missing_in_base": sorted(list(comp_cols - base_cols)),
+        "missing_in_compare": sorted(list(base_cols - comp_cols)),
+        "dtype_mismatches": [],
+        "with_map_unmatched": []  # pairs dropped because a side was missing
+    }
+
+    # Track dropped WITH pairs
+    if options.with_map:
+        for bcol, ccol in options.with_map.items():
+            if bcol not in base_cols or ccol not in comp_cols:
+                schema_diffs["with_map_unmatched"].append({"base_column": bcol, "compare_column": ccol})
+
+    # Dtype mismatches for the effective set
+    for bcol, ccol, rname in pairs:
+        if base.schema.get(bcol) != comp.schema.get(ccol):
+            schema_diffs["dtype_mismatches"].append(
+                {"column": rname, "base_dtype": str(base.schema.get(bcol)), "compare_dtype": str(comp.schema.get(ccol))}
+            )
+
+    # Only-in key sets
+    base_keys = base.select(id_cols).unique(maintain_order=True)
+    comp_keys = comp.select(id_cols).unique(maintain_order=True)
+    only_in_base = base_keys.join(comp_keys, on=id_cols, how="anti")
+    only_in_compare = comp_keys.join(base_keys, on=id_cols, how="anti")
+
+    # Align by inner join on keys with renamed columns
+    left = base.select(id_cols + [p[0] for p in pairs]).rename({p[0]: f"base__{p[2]}" for p in pairs})
+    right = comp.select(id_cols + [p[1] for p in pairs]).rename({p[1]: f"comp__{p[2]}" for p in pairs})
+    joined = left.join(right, on=id_cols, how="inner")
+
+    # Equality flags & reasons per reported column
+    eq_flags: List[pl.Expr] = []
+    reasons: List[pl.Expr] = []
+
+    for bcol, ccol, rname in pairs:
+        a = pl.col(f"base__{rname}")
+        b = pl.col(f"comp__{rname}")
+
+        # Decide comparison by dtype family
+        b_dtype = base.schema.get(bcol)
+        c_dtype = comp.schema.get(ccol)
+
+        is_num = pl.datatypes.is_numeric(b_dtype) and pl.datatypes.is_numeric(c_dtype)
+        is_strish = (b_dtype in (pl.Utf8, pl.Categorical)) or (c_dtype in (pl.Utf8, pl.Categorical))
+
+        if is_num:
+            eq_expr = (
+                pl.when(a.is_null() & b.is_null()).then(options.nulls_equal)
+                 .when(a.is_null() ^ b.is_null()).then(False)
+                 .otherwise(_numeric_threshold(a.cast(pl.Float64), b.cast(pl.Float64),
+                                               options.abs_tol, options.rel_tol, options.method))
+                 .alias(f"eq__{rname}")
+            )
+            reason = pl.when(pl.col(f"eq__{rname}")).then(pl.lit(None)).otherwise(pl.lit("numeric_tolerance")).alias(f"reason__{rname}")
+        elif is_strish:
+            a_norm = _normalize_string_expr(a.cast(pl.Utf8), options=options)
+            b_norm = _normalize_string_expr(b.cast(pl.Utf8), options=options)
+            eq_expr = _eq_with_nulls(a_norm, b_norm, options.nulls_equal).alias(f"eq__{rname}")
+            reason = pl.when(pl.col(f"eq__{rname}")).then(pl.lit(None)).otherwise(pl.lit("string_mismatch")).alias(f"reason__{rname}")
+        else:
+            eq_expr = _eq_with_nulls(a, b, options.nulls_equal).alias(f"eq__{rname}")
+            reason = pl.when(pl.col(f"eq__{rname}")).then(pl.lit(None)).otherwise(pl.lit("value_mismatch")).alias(f"reason__{rname}")
+
+        eq_flags.append(eq_expr)
+        reasons.append(reason)
+
+    if pairs:
+        joined = joined.with_columns(eq_flags + reasons)
+
+    # Long deltas table (only differences)
+    if pairs:
+        stacks = []
+        for _, _, rname in pairs:
+            stacks.append(
+                pl.struct(
+                    **{k: pl.col(k) for k in id_cols},
+                    column=pl.lit(rname),
+                    base_value=pl.col(f"base__{rname}").cast(pl.Utf8),
+                    compare_value=pl.col(f"comp__{rname}").cast(pl.Utf8),
+                    equal=pl.col(f"eq__{rname}"),
+                    diff_reason=pl.col(f"reason__{rname}")
+                ).alias(f"stack__{rname}")
+            )
+        deltas_long = (
+            joined.select([pl.col(f"stack__{r}") for _, _, r in pairs])
+                  .select(pl.concat_list(pl.all()).alias("z"))
+                  .explode("z")
+                  .select(
+                      [pl.col("z").struct.field(k).alias(k) for k in (id_cols + ["column", "base_value", "compare_value", "equal", "diff_reason"])]
+                  )
+                  .filter(pl.col("equal") == False)
+                  .with_columns(pl.col("diff_reason").fill_null("value_mismatch"))
+        )
+    else:
+        deltas_long = pl.DataFrame({**{k: pl.Series([], dtype=pl.Utf8) for k in id_cols},
+                                    "column": pl.Series([], dtype=pl.Utf8),
+                                    "base_value": pl.Series([], dtype=pl.Utf8),
+                                    "compare_value": pl.Series([], dtype=pl.Utf8),
+                                    "equal": pl.Series([], dtype=pl.Boolean),
+                                    "diff_reason": pl.Series([], dtype=pl.Utf8)})
+
+    # Per-column stats & summary
+    if pairs:
+        reported_cols = [r for _, _, r in pairs]
+        n_obs = joined.height
+        per_col_rows: List[pl.DataFrame] = []
+        for r in reported_cols:
+            per_col_rows.append(
+                pl.DataFrame({
+                    "column": [r],
+                    "n_compared": [n_obs],
+                    "n_equal": [joined.select(pl.col(f"eq__{r}").sum()).item() if n_obs else 0],
+                })
+            )
+        per_column_stats = pl.concat(per_col_rows).with_columns(
+            (pl.col("n_compared") - pl.col("n_equal")).alias("n_diff"),
+            pl.when(pl.col("n_compared") > 0, pl.col("n_equal") / pl.col("n_compared")).otherwise(1.0).alias("pct_equal")
+        )
+        n_cols = len(reported_cols)
+        n_cells = n_obs * n_cols
+        n_diff_cells = int(per_column_stats["n_diff"].sum())
+        pct_equal_cells = 1.0 if n_cells == 0 else (n_cells - n_diff_cells) / n_cells
+    else:
+        per_column_stats = pl.DataFrame({"column": [], "n_compared": [], "n_equal": [], "n_diff": [], "pct_equal": []})
+        n_obs = 0
+        n_cols = 0
+        n_cells = 0
+        n_diff_cells = 0
+        pct_equal_cells = 1.0
+
+    only_in_base = only_in_base.select(id_cols)
+    only_in_compare = only_in_compare.select(id_cols)
+
+    summary = {
+        "rows_in_base": int(base.select(id_cols).unique().height),
+        "rows_in_compare": int(comp.select(id_cols).unique().height),
+        "rows_matched_on_id": int(n_obs),
+        "rows_only_in_base": int(only_in_base.height),
+        "rows_only_in_compare": int(only_in_compare.height),
+        "columns_compared": [r for _, _, r in pairs],
+        "n_cells_compared": int(n_cells),
+        "n_cells_different": int(n_diff_cells),
+        "pct_cells_equal": float(pct_equal_cells),
+        "tolerances": {"abs_tol": options.abs_tol, "rel_tol": options.rel_tol, "method": options.method},
+        "string_options": {"case_sensitive": options.case_sensitive, "ignore_whitespace": options.ignore_whitespace},
+        "nulls_equal": options.nulls_equal,
+        "with_map_used": bool(options.with_map),
+    }
+
+    return CompareResult(
+        summary=summary,
+        schema_diffs=schema_diffs,
+        only_in_base=only_in_base,
+        only_in_compare=only_in_compare,
+        deltas_long=deltas_long,
+        per_column_stats=per_column_stats,
+    )
+
+# ---------------------------
+# Writers (“OUT=” convenience)
+# ---------------------------
+
+def write_outputs(
+    result: CompareResult,
+    out_dir: str,
+    *,
+    basename: str = "proc_compare",
+    formats: Iterable[Literal["csv","parquet"]] = ("parquet",),
+) -> Dict[str, str]:
+    """
+    Save deltas_long and per_column_stats. Returns dict of written paths.
+    """
+    paths: Dict[str, str] = {}
+    if "parquet" in formats:
+        p1 = f"{out_dir}/{basename}_deltas.parquet"
+        p2 = f"{out_dir}/{basename}_column_stats.parquet"
+        result.deltas_long.write_parquet(p1)
+        result.per_column_stats.write_parquet(p2)
+        paths["deltas_parquet"] = p1
+        paths["column_stats_parquet"] = p2
+    if "csv" in formats:
+        c1 = f"{out_dir}/{basename}_deltas.csv"
+        c2 = f"{out_dir}/{basename}_column_stats.csv"
+        result.deltas_long.write_csv(c1)
+        result.per_column_stats.write_csv(c2)
+        paths["deltas_csv"] = c1
+        paths["column_stats_csv"] = c2
+    return paths
+
+# ---------------------------
+# HTML report (MAXPRINT)
+# ---------------------------
+
+def render_compare_html(
+    result: CompareResult,
+    *,
+    title: str = "PROC COMPARE (Polars) Report",
+    sample_per_column: int = 20,         # MAXPRINT-like
+    include_only_in_tables: bool = True, # show keys only-in-* (IDs only)
+    show_schema_diffs: bool = True,
+) -> str:
+    """
+    Returns a complete HTML string. You can write it to a file.
+    """
+    import html
+    import pandas as pd
+
+    # Small CSS for readability (no external deps)
+    css = """
+    <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Helvetica,Arial,sans-serif;margin:24px}
+    h1{margin:0 0 16px 0;font-size:22px}
+    h2{margin-top:28px;font-size:18px;border-bottom:1px solid #ddd;padding-bottom:4px}
+    table{border-collapse:collapse;width:100%;margin:8px 0}
+    th,td{border:1px solid #e5e7eb;padding:6px 8px;font-size:13px}
+    th{background:#f8fafc;text-align:left}
+    .muted{color:#6b7280}
+    .code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .kpi{display:inline-block;margin-right:14px;padding:6px 10px;background:#f1f5f9;border-radius:6px}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2ff}
+    .section{margin-top:18px}
+    .colname{font-weight:600}
+    .diff-reason{font-family:ui-monospace}
+    </style>
+    """
+
+    # Summary
+    s = result.summary
+    summary_html = f"""
+    <div class="section">
+      <div class="kpi"><b>Rows (base)</b>: {s['rows_in_base']}</div>
+      <div class="kpi"><b>Rows (compare)</b>: {s['rows_in_compare']}</div>
+      <div class="kpi"><b>Matched</b>: {s['rows_matched_on_id']}</div>
+      <div class="kpi"><b>Only in base</b>: {s['rows_only_in_base']}</div>
+      <div class="kpi"><b>Only in compare</b>: {s['rows_only_in_compare']}</div>
+      <div class="kpi"><b>Cells compared</b>: {s['n_cells_compared']}</div>
+      <div class="kpi"><b>Cells different</b>: {s['n_cells_different']}</div>
+      <div class="kpi"><b>% cells equal</b>: {s['pct_cells_equal']:.4f}</div>
+    </div>
+    <div class="muted">Tolerances: abs={s['tolerances']['abs_tol']}, rel={s['tolerances']['rel_tol']} (method={s['tolerances']['method']}) · Strings: case_sensitive={s['string_options']['case_sensitive']}, ignore_whitespace={s['string_options']['ignore_whitespace']} · nulls_equal={s['nulls_equal']} · with_map={s['with_map_used']}</div>
+    """
+
+    # Schema diffs
+    schema_html = ""
+    if show_schema_diffs:
+        sd = result.schema_diffs
+        def tbl(rows: List[Dict[str,str]]) -> str:
+            if not rows:
+                return "<p class='muted'>None.</p>"
+            df = pd.DataFrame(rows)
+            return df.to_html(index=False, escape=True)
+        parts = []
+        parts.append("<h2>Schema Differences</h2>")
+        parts.append("<h3>Columns missing in base</h3>" + tbl([{"column": c} for c in sd["missing_in_base"]]))
+        parts.append("<h3>Columns missing in compare</h3>" + tbl([{"column": c} for c in sd["missing_in_compare"]]))
+        parts.append("<h3>Dtype mismatches</h3>" + tbl(sd["dtype_mismatches"]))
+        if sd.get("with_map_unmatched"):
+            parts.append("<h3>WITH pairs dropped</h3>" + tbl(sd["with_map_unmatched"]))
+        schema_html = "\n".join(parts)
+
+    # Only-in tables (IDs only)
+    onlyin_html = ""
+    if include_only_in_tables:
+        oi_b = result.only_in_base
+        oi_c = result.only_in_compare
+        def head_df(df: pl.DataFrame, n=50) -> str:
+            if df.is_empty():
+                return "<p class='muted'>None.</p>"
+            return df.head(n).to_pandas().to_html(index=False)
+        onlyin_html = f"""
+        <h2>Keys only in base (first 50)</h2>
+        {head_df(oi_b)}
+        <h2>Keys only in compare (first 50)</h2>
+        {head_df(oi_c)}
+        """
+
+    # Per-column stats
+    stats_html = "<h2>Per-column results</h2>" + result.per_column_stats.sort("n_diff", descending=True).to_pandas().to_html(index=False)
+
+    # Deltas by column (sample_per_column = MAXPRINT)
+    dl = result.deltas_long
+    deltas_html_parts = ["<h2>Differences (samples by column)</h2>"]
+    if dl.is_empty():
+        deltas_html_parts.append("<p class='muted'>No cell-level differences.</p>")
+    else:
+        reported_cols = result.per_column_stats["column"].to_list()
+        id_cols = [c for c in dl.columns if c not in ("column","base_value","compare_value","equal","diff_reason")]
+        for col in reported_cols:
+            sub = dl.filter(pl.col("column") == col).head(sample_per_column)
+            if sub.is_empty():
+                continue
+            deltas_html_parts.append(f"<h3><span class='colname'>{html.escape(col)}</span> <span class='badge'>showing up to {sample_per_column}</span></h3>")
+            deltas_html_parts.append(
+                sub.select(id_cols + ["base_value","compare_value","diff_reason"]).to_pandas().to_html(index=False, escape=True)
+            )
+    deltas_html = "\n".join(deltas_html_parts)
+
+    html_doc = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{html.escape(title)}</title>{css}</head>
+<body>
+<h1>{html.escape(title)}</h1>
+{summary_html}
+{schema_html}
+{onlyin_html}
+{stats_html}
+{deltas_html}
+</body></html>
+"""
+    return html_doc
