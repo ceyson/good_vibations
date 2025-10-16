@@ -1,0 +1,92 @@
+# --- HTML helpers for pretty notebook output ---
+
+def _html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&#39;")
+        if s is not None else ""
+    )
+
+def _try_display_html(html: str) -> bool:
+    """Best-effort HTML display: Databricks displayHTML -> IPython -> print."""
+    try:
+        # Databricks notebooks
+        if "displayHTML" in globals():
+            globals()["displayHTML"](html)
+            return True
+    except Exception:
+        pass
+    try:
+        # Jupyter/Colab
+        from IPython.display import display, HTML  # type: ignore
+        display(HTML(html))
+        return True
+    except Exception:
+        pass
+    # Fallback
+    print(html)
+    return False
+
+
+def render_proc_compare_html(
+    *,
+    keys: Sequence[str],
+    total_A_rows: int,
+    total_B_rows: int,
+    matched_row_count: int,
+    mismatch_row_count: int,
+    missing_in_A_count: int,
+    missing_in_B_count: int,
+    column_summary: DataFrame,
+    top_k_columns: int = 25,
+    title: str = "PROC COMPARE (Spark)",
+) -> str:
+    """Return a styled HTML version of the summary + top columns table."""
+    def card(label: str, value: str) -> str:
+        return f"""
+        <div style='flex:1; padding:12px; margin:6px; border:1px solid #eee; border-radius:10px;'>
+          <div style='font-size:12px;color:#666'>{_html_escape(label)}</div>
+          <div style='font-size:20px;font-weight:600;margin-top:4px'>{_html_escape(value)}</div>
+        </div>
+        """
+
+    # Collect the top-k rows to show in the table
+    rows = column_summary.limit(top_k_columns).collect()
+    table_rows = "".join(
+        f"<tr><td>{_html_escape(str(r['column']))}</td>"
+        f"<td style='text-align:right'>{int(r['n_diff_cells']):,}</td>"
+        f"<td style='text-align:right'>{int(r['n_rows_with_diff']):,}</td></tr>"
+        for r in rows
+    )
+
+    html = f"""
+    <div style='font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; line-height:1.35;'>
+      <h2 style='margin:0 0 8px 0'>{_html_escape(title)}</h2>
+      <div style='margin-bottom:6px;color:#555'>Keys: {_html_escape(', '.join(keys))}</div>
+      <div style='display:flex; flex-wrap:wrap'>
+        {card('Table A rows', f"{total_A_rows:,}")}
+        {card('Table B rows', f"{total_B_rows:,}")}
+        {card('Matched keys (inner)', f"{matched_row_count:,}")}
+        {card('Rows with any differences', f"{mismatch_row_count:,}")}
+        {card('Missing in A', f"{missing_in_A_count:,}")}
+        {card('Missing in B', f"{missing_in_B_count:,}")}
+      </div>
+      <h3 style='margin:18px 0 6px 0;'>Top {top_k_columns} differing columns</h3>
+      <table style='border-collapse:collapse; width:100%'>
+        <thead>
+          <tr>
+            <th style='text-align:left;border-bottom:1px solid #ddd;padding:6px 4px'>column</th>
+            <th style='text-align:right;border-bottom:1px solid #ddd;padding:6px 4px'>n_diff_cells</th>
+            <th style='text-align:right;border-bottom:1px solid #ddd;padding:6px 4px'>n_rows_with_diff</th>
+          </tr>
+        </thead>
+        <tbody>
+          {table_rows if table_rows else "<tr><td colspan='3' style='padding:8px;color:#666'>No column differences</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+    """
+    return html
