@@ -1,0 +1,71 @@
+def display_report_with_samples(
+    self,
+    report_text: str,
+    artifacts: Dict[str, object],
+    *,
+    top_k_columns: Optional[int] = None,
+    also_print_text: bool = True,
+    title: str = "PROC COMPARE (Spark)",
+    sample_rows: int = 10,
+) -> None:
+    """Summary cards + Top columns + a small table of sample deltas (HTML)."""
+    # 1) Summary HTML
+    metrics = artifacts.get("metrics", {}) if isinstance(artifacts, dict) else {}
+    if metrics:
+        total_A_rows     = metrics.get("total_A_rows", 0)
+        total_B_rows     = metrics.get("total_B_rows", 0)
+        matched_row_cnt  = metrics.get("matched_row_count", 0)
+        mismatch_row_cnt = metrics.get("mismatch_row_count", 0)
+        missA_cnt        = metrics.get("missing_in_A_count", 0)
+        missB_cnt        = metrics.get("missing_in_B_count", 0)
+    else:
+        rr = artifacts.get("row_res", {}) if isinstance(artifacts, dict) else {}
+        total_A_rows = total_B_rows = matched_row_cnt = 0
+        mismatch_row_cnt = rr.get("mismatch_keys").count() if rr else 0
+        missA_cnt = rr.get("missing_in_A").count() if rr else 0
+        missB_cnt = rr.get("missing_in_B").count() if rr else 0
+
+    col_summary = artifacts.get("column_summary") if isinstance(artifacts, dict) else None
+    if also_print_text and report_text:
+        print(report_text)
+        print("\n")
+
+    summary_html = render_proc_compare_html(
+        keys=self.keys,
+        total_A_rows=total_A_rows,
+        total_B_rows=total_B_rows,
+        matched_row_count=matched_row_cnt,
+        mismatch_row_count=mismatch_row_cnt,
+        missing_in_A_count=missA_cnt,
+        missing_in_B_count=missB_cnt,
+        column_summary=col_summary,
+        top_k_columns=top_k_columns if top_k_columns is not None else self.top_k_columns,
+        title=title,
+    )
+
+    # 2) Sample rows from diffs (prefer numeric deltas if present)
+    sample_dicts: List[Dict[str, object]] = []
+    try:
+        diffs = artifacts.get("diffs")
+        if diffs is not None:
+            # Select numeric-forward view; if those columns don't exist, fall back
+            select_cols = [F.col(k) for k in self.keys] + [
+                F.col("column"),
+                F.col("a_num"), F.col("b_num"),
+                F.col("diff_num"), F.col("rel_diff"),
+                F.col("a_value"), F.col("b_value"),
+            ]
+            try:
+                rows = diffs.select(*select_cols).limit(sample_rows).collect()
+            except Exception:
+                # Fallback to original a_value/b_value only
+                rows = diffs.select(*([F.col(k) for k in self.keys] + [F.col("column"), F.col("a_value"), F.col("b_value")])) \
+                            .limit(sample_rows).collect()
+            sample_dicts = [r.asDict() for r in rows]
+    except Exception:
+        sample_dicts = []
+
+    sample_html = render_deltas_sample_html(keys=self.keys, sample_rows=sample_dicts)
+
+    # 3) Display combined HTML
+    _try_display_html(summary_html + sample_html)
